@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+
+"""
+ukb_wes_exwas_vig_vs_sed.py
+===========================
+
+UK Biobank OQFE WES Exome-Wide Association Study (ExWAS) helper that models
+vigorous activity vs sedentary activity using REGENIE.
+
+What it does
+------------
+
+1) Builds a REGENIE-ready .phe:
+   - Reads participant CSV/Parquet with EID + activity + covariates
+   - Optionally derives season/quarter from a date column
+   - Transforms TWO activity columns independently:
+       * outcome (phenotype): vigorous_activity
+       * adjuster (covariate): sedentary_activity
+     Each can be normalized to [0,1] and optionally inverted.
+   - Harmonizes with WES .fam
+   - Writes .phe with both transformed columns
+
+2) Runs ExWAS via REGENIE (two-step mixed model):
+   - Step 1: whole-genome regression on array data to correct for
+     population structure, cryptic relatedness, and polygenic background
+   - Step 2: per-chromosome WES association testing conditioned on
+     step 1 predictions
+
+REGENIE is used exclusively because:
+   - The analysis involves n ~ 91,000 participants with whole-exome
+     sequencing data, a scale at which simple linear regression (PLINK2
+     --glm) produces inflated test statistics due to cryptic relatedness
+     in UK Biobank
+   - REGENIE's whole-genome regression in step 1 simultaneously corrects
+     for population stratification, polygenic background, and relatedness
+     without requiring explicit kinship matrix computation
+   - This is the standard methodology for UK Biobank exome-wide analyses
+     at this sample size
+
+Usage example
+-------------
+
+python ukb_wes_exwas_vig_vs_sed.py \
+    --source accel_covariates.csv \
+    --fam ukb23158_c1_b0_v1.fam \
+    --eid-col eid \
+    --phenotype-col vigorous_activity --phenotype-invert \
+    --adjust-col sedentary_activity \
+    --covars-base 31,21022,22009_1,22009_2,22009_3,22009_4,22009_5 \
+    --phe-out pa_wes_vig_vs_sed.phe \
+    --array-prefix /data/ukb_array_merged \
+    --wes-prefix /data/ukb23158_c{CHR}_b0_v1 \
+    --threads 8
+"""
+
+import os
+import argparse
+import subprocess
+import pandas as pd
+import numpy as np
+
+
+# ==================== HELPERS ====================
+
+def read_fam(fam_path: str) -> pd.DataFrame:
+    """Read a PLINK .fam file into a DataFrame."""
+    fam_cols = ["FID", "IID", "PID", "MID", "SEX", "PHENOTYPE"]
+    return pd.read_csv(fam_path, sep=r"\s+", header=None, names=fam_cols)
+
+
+def derive_quarter(df: pd.DataFrame, date_col: str | None) -> pd.DataFrame:
+    """
+    Add a wear_quarter column (1-4) derived from an accelerometer date column.
+    Controls for seasonal variation in physical activity levels.
+    """
+    if date_col and date_col in df.columns:
+        df["_date_tmp"] = pd.to_datetime(df[date_col], errors="coerce")
+        df["wear_quarter"] = df["_date_tmp"].dt.quarter
+        df.drop(columns=["_date_tmp"], inplace=True)
+    return df
+
+
+def normalize_series(s: pd.Series) -> pd.Series:
+    """Rescale a numeric series to [0, 1]."""
+    s = pd.to_numeric(s, errors="coerce")
+    mn, mx = s.min(skipna=True), s.max(skipna=True)
+    if pd.isna(mn) or pd.isna(mx) or mx == mn:
+        return pd.Series(np.nan, index=s.index)
+    return (s - mn) / (mx - mn)
+
+
+def transform_trait(
+    df: pd.DataFrame,
+    col: str,
+    do_norm: bool,
+    do_inv: bool,
+    label: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Normalize and optionally invert an activity column.
+
+    Inversion (1 - normalized value) is applied to the vigorous activity
+    outcome so that SNPs associated with more vigorous / less sedentary
+    behaviour have a consistent positive effect direction in the ExWAS.
+    """
+    if col not in df.columns:
+        raise ValueError(f"Column '{col}' not found in source table.")
+    if not do_norm and do_inv:
+        raise ValueError(f"--{label}-invert requires --{label}-normalize.")
+
+    if do_norm:
+        norm = normalize_series(df[col])
+        if do_inv:
+            out_col = f"{col}_norm_inv"
+            df[out_col] = 1.0 - norm
+        else:
+            out_col = f"{col}_norm"
+            df[out_col] = norm
+    else:
+        out_col = col
+        df[out_col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df, out_col
+
+
+def harmonize_with_fam(
+    df: pd.DataFrame,
+    fam: pd.DataFrame,
+    eid_col: str,
+) -> pd.DataFrame:
+    """
+    Inner-join the participant table with the WES .fam file on participant ID.
+    Only individuals present in both datasets are retained.
+    FID is set equal to IID (standard for unrelated UKB participants).
+    """
+    df[eid_col] = pd.to_numeric(df[eid_col], errors="coerce").astype("Int64")
+    fam["IID"] = pd.to_numeric(fam["IID"], errors="coerce").astype("Int64")
+    df["FID"] = df[eid_col]
+    df["IID"] = df[eid_col]
+    merged = fam[["FID", "IID"]].merge(
+        df.drop(columns=[c for c in ["FID", "IID"] if c in df.columns]),
+        on="IID",
+        how="inner",
+    )
+    merged["FID"] = merged["IID"]
+    return merged
+
+
+def write_phe(df: pd.DataFrame, out_path: str) -> None:
+    """
+    Write phenotype file in REGENIE format.
+    FID and IID must be the first two columns; missing values written as NA.
+    """
+    cols = df.columns.tolist()
+    front = [c for c in ["FID", "IID"] if c in cols]
+    rest = [c for c in cols if c not in front]
+    df[front + rest].to_csv(out_path, sep="\t", index=False, na_rep="NA")
+
+
+# ==================== REGENIE RUNNER ====================
+
+def run_regenie(
+    array_prefix: str,
+    wes_prefix: str,
+    phe: str,
+    pheno_name: str,
+    covars: list[str],
+    outdir1: str,
+    outdir2: str,
+    threads: int = 8,
+    chr_list=range(1, 23),
+    mac_min: int = 5,
+) -> None:
+    """
+    Run REGENIE two-step ExWAS.
+
+    Step 1 — whole-genome regression on array genotypes:
+        Fits a leave-one-chromosome-out (LOCO) mixed model across all
+        common array variants to estimate each participant's polygenic
+        background. This correction accounts simultaneously for:
+          - Population stratification
+          - Cryptic relatedness between participants
+          - Polygenic background inflation
+        Output: per-participant prediction files used as offsets in step 2.
+
+    Step 2 — per-chromosome WES association testing:
+        Tests each exonic variant for association with the outcome while
+        conditioning on the step 1 predictions. Run separately per
+        chromosome to allow parallelisation.
+    """
+    os.makedirs(outdir1, exist_ok=True)
+    os.makedirs(outdir2, exist_ok=True)
+
+    phe_df = pd.read_csv(phe, sep="\t")
+    keep = os.path.join(outdir1, "samples.keep")
+    phe_df[["FID", "IID"]].to_csv(keep, sep=" ", index=False, header=False)
+
+    covar_str = ",".join(covars)
+
+    # ---- Step 1: whole-genome regression on array data ----
+    cmd1 = [
+        "regenie", "--step", "1",
+        "--bed", array_prefix,
+        "--keep", keep,
+        "--phenoFile", phe, "--phenoCol", pheno_name,
+        "--covarFile", phe, "--covarColList", covar_str,
+        "--bsize", "1000",
+        "--lowmem",
+        "--lowmem-prefix", os.path.join(outdir1, "tmp_chunks"),
+        "--threads", str(threads),
+        "--out", os.path.join(outdir1, "step1"),
+    ]
+    print("[REGENIE step 1]", " ".join(cmd1))
+    subprocess.check_call(cmd1)
+
+    # Build prediction list (REGENIE writes this automatically;
+    # the block below is a fallback in case the file is missing)
+    pred_list = os.path.join(outdir1, "step1_pred.list")
+    if not os.path.exists(pred_list):
+        preds = [
+            os.path.join(outdir1, f)
+            for f in sorted(os.listdir(outdir1))
+            if f.endswith(".pred")
+        ]
+        with open(pred_list, "w") as fh:
+            for p in preds:
+                fh.write(p + "\n")
+
+    # ---- Step 2: per-chromosome WES association testing ----
+    for chrn in chr_list:
+        bed_prefix = wes_prefix.replace("{CHR}", str(chrn))
+        outbase = os.path.join(outdir2, f"chr{chrn}")
+        cmd2 = [
+            "regenie", "--step", "2",
+            "--bed", bed_prefix,
+            "--keep", keep,
+            "--phenoFile", phe, "--phenoCol", pheno_name,
+            "--covarFile", phe, "--covarColList", covar_str,
+            "--pred", pred_list,
+            "--minMAC", str(mac_min),
+            "--threads", str(threads),
+            "--out", outbase,
+        ]
+        print(f"[REGENIE step 2 chr{chrn}]", " ".join(cmd2))
+        subprocess.check_call(cmd2)
+
+
+# ==================== MAIN ====================
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="ExWAS: vigorous vs sedentary activity using REGENIE mixed model."
+    )
+
+    # Input data
+    ap.add_argument(
+        "--source", required=True,
+        help="CSV or Parquet participant table with EID, activity columns, and covariates",
+    )
+    ap.add_argument("--fam", required=True, help="WES .fam path (any chromosome)")
+    ap.add_argument("--eid-col", default="eid", help="Participant ID column name")
+    ap.add_argument(
+        "--date-col", default=None,
+        help="Optional accelerometer date column for wear-quarter covariate",
+    )
+
+    # Outcome (vigorous activity)
+    ap.add_argument(
+        "--phenotype-col", required=True,
+        help="Outcome column (e.g. vigorous_activity)",
+    )
+    ap.add_argument(
+        "--phenotype-normalize", action="store_true", default=True,
+        help="Normalize outcome to [0,1] (default: on)",
+    )
+    ap.add_argument(
+        "--phenotype-no-normalize",
+        dest="phenotype_normalize", action="store_false",
+        help="Disable normalization for outcome",
+    )
+    ap.add_argument(
+        "--phenotype-invert", action="store_true",
+        help="Invert outcome after normalization (recommended for vigorous activity)",
+    )
+
+    # Adjuster covariate (sedentary activity)
+    ap.add_argument(
+        "--adjust-col", required=True,
+        help="Adjuster covariate column (e.g. sedentary_activity)",
+    )
+    ap.add_argument(
+        "--adjust-normalize", action="store_true", default=True,
+        help="Normalize adjuster to [0,1] (default: on)",
+    )
+    ap.add_argument(
+        "--adjust-no-normalize",
+        dest="adjust_normalize", action="store_false",
+        help="Disable normalization for adjuster",
+    )
+    ap.add_argument(
+        "--adjust-invert", action="store_true",
+        help="Invert adjuster after normalization",
+    )
+
+    # Covariates and output
+    ap.add_argument(
+        "--covars-base", default="",
+        help=(
+            "Comma-separated base covariate column names "
+            "(e.g. 31,21022,22009_1,22009_2,22009_3,22009_4,22009_5 "
+            "for sex, age, and first 5 genetic PCs). "
+            "The transformed adjuster column is appended automatically."
+        ),
+    )
+    ap.add_argument(
+        "--phe-out", default="pa_wes_vig_vs_sed.phe",
+        help="Output .phe file path",
+    )
+
+    # REGENIE inputs (both required)
+    ap.add_argument(
+        "--array-prefix", required=True,
+        help="Array PLINK prefix for REGENIE step 1 (genome-wide common variants)",
+    )
+    ap.add_argument(
+        "--wes-prefix", required=True,
+        help="WES PLINK prefix with {CHR} placeholder (e.g. /data/ukb23158_c{CHR}_b0_v1)",
+    )
+    ap.add_argument("--threads", type=int, default=8, help="CPU threads for REGENIE")
+
+    args = ap.parse_args()
+
+    # ---- Load participant table ----
+    if args.source.lower().endswith(".csv"):
+        df = pd.read_csv(args.source)
+    elif args.source.lower().endswith(".parquet"):
+        df = pd.read_parquet(args.source)
+    else:
+        raise ValueError("--source must be a .csv or .parquet file")
+
+    # ---- Prepare phenotype file ----
+    df = derive_quarter(df, args.date_col)
+
+    df, pheno_col_out = transform_trait(
+        df, args.phenotype_col,
+        args.phenotype_normalize,
+        args.phenotype_invert,
+        label="phenotype",
+    )
+    df, adjust_col_out = transform_trait(
+        df, args.adjust_col,
+        args.adjust_normalize,
+        args.adjust_invert,
+        label="adjust",
+    )
+
+    fam = read_fam(args.fam)
+    phe_df = harmonize_with_fam(df, fam, eid_col=args.eid_col)
+    write_phe(phe_df, args.phe_out)
+
+    print(f"\n[OK] Phenotype file written: {args.phe_out}")
+    print(f"     Outcome   : {pheno_col_out}")
+    print(f"     Adjuster  : {adjust_col_out}")
+    print(f"     N samples : {len(phe_df)}")
+
+    # ---- Build full covariate list ----
+    # Base covariates (sex, age, genetic PCs, wear quarter if present)
+    # plus the transformed sedentary activity column
+    base_covars = [c.strip() for c in args.covars_base.split(",") if c.strip()]
+    if "wear_quarter" in phe_df.columns:
+        base_covars.append("wear_quarter")
+    covars_full = base_covars + [adjust_col_out]
+
+    print(f"     Covariates: {covars_full}\n")
+
+    # ---- Run REGENIE ----
+    run_regenie(
+        array_prefix=args.array_prefix,
+        wes_prefix=args.wes_prefix,
+        phe=args.phe_out,
+        pheno_name=pheno_col_out,
+        covars=covars_full,
+        outdir1="results/regenie_step1",
+        outdir2="results/regenie_step2_wes",
+        threads=args.threads,
+    )
+
+
+if __name__ == "__main__":
+    main()
