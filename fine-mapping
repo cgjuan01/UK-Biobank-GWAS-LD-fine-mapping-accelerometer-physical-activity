@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+
+"""
+exwas_finemap.py
+================
+
+Fine-mapping pipeline for UK Biobank OQFE WES ExWAS (vigorous vs sedentary).
+
+Takes REGENIE step 2 association summary statistics and WES PLINK genotypes
+from the same study participants and performs statistical fine-mapping to
+identify the most probable causal variant(s) at each associated locus.
+
+What it does
+------------
+
+1) Reads and standardises REGENIE step 2 summary statistics.
+
+2) Identifies independent association loci by LD clumping (PLINK2):
+   - Lead variants selected at p < 5e-8 (genome-wide significance)
+   - Clumping window: ±500 kb, r² threshold 0.1
+   - LD computed from WES genotypes (same participants as ExWAS)
+
+3) For each locus:
+   - Extracts all variants in a ±500 kb window
+   - Computes a full LD correlation matrix from WES genotypes (PLINK2 --r square)
+   - Prepares FINEMAP input files (.z, .ld, .snp, .master)
+   - Optionally runs FINEMAP (--sss stochastic search)
+   - Optionally runs SuSiE via a generated R script (susieR package)
+
+4) Writes a loci_manifest.tsv summarising all fine-mapped loci.
+
+Why WES-derived LD
+------------------
+The LD matrix is computed directly from the 91,184 study participants rather
+than from an external reference panel (e.g. 1000 Genomes). This is important
+because:
+  - Exome sequencing captures rare and low-frequency coding variants that are
+    absent or poorly represented in reference panels
+  - LD patterns at coding variants differ from those at common tag SNPs
+  - Using the study LD ensures the fine-mapping model is internally consistent
+    with the instrument discovery stage
+The resulting per-locus LD matrices are also used downstream in the
+GLS-IVW Mendelian randomisation as the instrument correlation matrix.
+
+Usage
+-----
+
+python exwas_finemap.py \
+    --sumstats results/regenie_step2_wes/chr_combined.tsv \
+    --wes-prefix /data/ukb23158_c{CHR}_b0_v1 \
+    --keep results/regenie_step1/samples.keep \
+    --outdir finemap_vig_vs_sed \
+    --n 91184 \
+    --p-thresh 5e-8
+
+For REGENIE output the default column names map directly.
+If your combined file uses different names, override with
+--id-col / --chr-col / --pos-col / --beta-col / --se-col / --p-col.
+
+Notes
+-----
+- Requires PLINK2 in PATH for clumping and LD computation.
+- For FINEMAP: provide --finemap-exe path.
+- For SuSiE: requires Rscript with susieR installed; add --run-susie.
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import gzip
+import shutil
+
+import pandas as pd
+import numpy as np
+
+
+# ==================== HELPERS ====================
+
+def run(cmd: list[str], cwd: str | None = None) -> None:
+    """Run a shell command, printing it first. Raises on failure."""
+    print("[cmd]", " ".join(cmd))
+    subprocess.check_call(cmd, cwd=cwd)
+
+
+def read_sumstats(path: str, cols: dict) -> pd.DataFrame:
+    """
+    Read REGENIE step 2 summary statistics and rename columns to
+    the internal standard: SNP, CHR, BP, A1, A2, BETA, SE, P, N.
+
+    REGENIE default column names:
+        ID / CHROM / GENPOS / ALLELE0 / ALLELE1 / BETA / SE / LOG10P
+    This function accepts either LOG10P or a direct P column; if LOG10P
+    is supplied it is converted back to P before returning.
+    """
+    df = pd.read_csv(path, sep=r"\s+")
+
+    missing = [k for k, v in cols.items() if v not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing required columns in summary statistics: {missing}. "
+            f"Available columns: {df.columns.tolist()}"
+        )
+
+    df = df.rename(columns={
+        cols["id"]:   "SNP",
+        cols["chr"]:  "CHR",
+        cols["pos"]:  "BP",
+        cols["a1"]:   "A1",
+        cols["a2"]:   "A2",
+        cols["beta"]: "BETA",
+        cols["se"]:   "SE",
+        cols["p"]:    "P",
+    })
+
+    # REGENIE outputs -log10(p); convert to p-value if needed
+    if df["P"].max() > 1.0:
+        print("[info] P column appears to be -log10(p); converting to p-value.")
+        df["P"] = 10 ** (-df["P"])
+
+    # Sample size: use per-variant column if available, else fill from --n
+    if "n" in cols and cols["n"] in df.columns:
+        df["N"] = df[cols["n"]]
+    elif "N" in df.columns:
+        pass
+    else:
+        df["N"] = np.nan
+
+    return df
+
+
+def plink2_clump(
+    sumstats_tsv: str,
+    wes_prefix: str,
+    keep: str,
+    outprefix: str,
+    p1: float = 5e-8,
+    p2: float = 1e-6,
+    r2: float = 0.1,
+    kb: int = 500,
+) -> tuple[str, pd.DataFrame]:
+    """
+    Identify independent lead variants by LD clumping using PLINK2.
+
+    Clumping logic:
+      1. Start with the most significant SNP (p < p1 = 5e-8).
+      2. Define a window of ±kb kilobases around it.
+      3. Remove all SNPs within that window correlated at r² > r2.
+      4. Move to the next most significant remaining SNP.
+      5. Repeat until no significant SNPs remain.
+
+    LD is computed from the WES genotypes of the study participants,
+    not from an external reference panel.
+    """
+    # Write a minimal clumping input with required columns
+    tmp = outprefix + ".clumpinput.tsv"
+    df = pd.read_csv(sumstats_tsv, sep="\t")
+    need = ["CHR", "BP", "SNP", "P"]
+    if not all(c in df.columns for c in need):
+        raise ValueError(
+            f"Clumping input must contain columns: {need}. "
+            f"Found: {df.columns.tolist()}"
+        )
+    df[need].to_csv(tmp, sep="\t", index=False)
+
+    clumped = []
+    for chrn in [str(c) for c in range(1, 23)]:
+        bfile = wes_prefix.replace("{CHR}", chrn)
+        if not (os.path.exists(bfile + ".bed") or os.path.exists(bfile + ".pgen")):
+            continue
+        out = f"{outprefix}.chr{chrn}"
+        run([
+            "plink2",
+            "--bfile", bfile,
+            "--keep", keep,
+            "--clump", tmp,
+            "--clump-snp-field", "SNP",
+            "--clump-field", "P",
+            "--clump-p1", str(p1),
+            "--clump-p2", str(p2),
+            "--clump-r2", str(r2),
+            "--clump-kb", str(kb),
+            "--out", out,
+        ])
+        clumped.append(out + ".clumps")
+
+    leads = []
+    for path in clumped:
+        if os.path.exists(path):
+            t = pd.read_csv(path, sep=r"\s+", comment="#")
+            if all(c in t.columns for c in ["CHR", "BP", "SNP", "P"]):
+                leads.append(t[["CHR", "BP", "SNP", "P"]])
+
+    if not leads:
+        raise RuntimeError(
+            "No lead variants found after clumping. "
+            "Check that your summary statistics contain genome-wide significant hits."
+        )
+
+    all_leads = pd.concat(leads, ignore_index=True).drop_duplicates("SNP")
+    lead_path = outprefix + ".lead.tsv"
+    all_leads.to_csv(lead_path, sep="\t", index=False)
+    print(f"[ok] {len(all_leads)} independent lead variants written to {lead_path}")
+    return lead_path, all_leads
+
+
+def extract_region_and_ld(
+    chrn: int,
+    start: int,
+    end: int,
+    wes_prefix: str,
+    keep: str,
+    outprefix: str,
+) -> tuple[str, str, str, str]:
+    """
+    Extract a genomic region from the WES data and compute its LD matrix.
+
+    The LD matrix (--r square) contains pairwise Pearson correlation
+    coefficients between all variants in the window. This matrix is used:
+      1. Here, as input to FINEMAP and SuSiE for fine-mapping.
+      2. Downstream, as the instrument correlation matrix (GS_LD_square)
+         in the GLS-IVW Mendelian randomisation estimator.
+    """
+    bfile = wes_prefix.replace("{CHR}", str(chrn))
+
+    # Extract region to a temporary PLINK binary set
+    run([
+        "plink2",
+        "--bfile", bfile,
+        "--keep", keep,
+        "--chr", str(chrn),
+        "--from-bp", str(start),
+        "--to-bp", str(end),
+        "--make-bed",
+        "--out", outprefix,
+    ])
+
+    # Compute full LD correlation matrix (not r²) among extracted variants
+    run([
+        "plink2",
+        "--bfile", outprefix,
+        "--r", "square", "gz",
+        "--out", outprefix,
+    ])
+
+    return (
+        outprefix + ".bed",
+        outprefix + ".bim",
+        outprefix + ".fam",
+        outprefix + ".ld.gz",
+    )
+
+
+def make_finemap_inputs(
+    locus_df: pd.DataFrame,
+    ld_gz: str,
+    bim_path: str,
+    n: int,
+    outprefix: str,
+) -> dict:
+    """
+    Prepare FINEMAP input files for one locus.
+
+    Files produced:
+      .z      — variant-level summary statistics (z-scores)
+      .ld     — LD correlation matrix (plain text, decompressed from .ld.gz)
+      .snp    — ordered list of variant IDs matching the LD matrix rows
+      .master — index file pointing FINEMAP to the above files
+    """
+    use = locus_df.copy()
+    required = ["SNP", "CHR", "BP", "A1", "A2", "BETA", "SE"]
+    missing = [c for c in required if c not in use.columns]
+    if missing:
+        raise ValueError(f"locus_df missing columns for FINEMAP: {missing}")
+
+    if "MAF" not in use.columns:
+        use["MAF"] = np.nan
+        print(
+            "[warn] MAF not available in summary statistics. "
+            "FINEMAP calibration may be suboptimal without allele frequencies."
+        )
+
+    use["N"] = n
+    z = use[["SNP", "CHR", "BP", "A1", "A2", "MAF", "BETA", "SE", "N"]].copy()
+    z.columns = ["rsid", "chromosome", "position", "allele1", "allele2",
+                 "maf", "beta", "se", "n"]
+    z_path = outprefix + ".z"
+    z.to_csv(z_path, sep=" ", index=False)
+
+    # Decompress LD matrix
+    ld_txt = outprefix + ".ld"
+    with gzip.open(ld_gz, "rt") as fin, open(ld_txt, "w") as fout:
+        shutil.copyfileobj(fin, fout)
+
+    # SNP order file — must match the row/column order of the LD matrix,
+    # which equals the variant order in the .bim file used for --r square
+    bim = pd.read_csv(
+        bim_path, sep="\t", header=None,
+        names=["CHR", "SNP", "CM", "BP", "A1", "A2"],
+    )
+    snp_path = outprefix + ".snp"
+    bim["SNP"].to_csv(snp_path, index=False, header=False)
+
+    # Master file
+    master = outprefix + ".master"
+    bn = os.path.basename
+    with open(master, "w") as fh:
+        fh.write("z;ld;snp;config;cred;log;n_samples\n")
+        fh.write(
+            f"{bn(z_path)};{bn(ld_txt)};{bn(snp_path)};"
+            f"{bn(outprefix)}.config;{bn(outprefix)}.cred;"
+            f"{bn(outprefix)}.log;{int(n)}\n"
+        )
+
+    return {"z": z_path, "ld": ld_txt, "snp": snp_path, "master": master}
+
+
+def write_susie_runner(outprefix: str, l: int = 10, coverage: float = 0.95) -> str:
+    """
+    Write a self-contained R script that runs SuSiE fine-mapping.
+
+    SuSiE (Sum of Single Effects) is a Bayesian fine-mapping method that:
+      - Models up to L independent causal variants per locus (default L=10)
+      - Returns a Posterior Inclusion Probability (PIP) per variant:
+        the probability that each SNP is a causal variant
+      - Constructs credible sets: minimal sets of variants with >=95%
+        probability of containing the true causal variant
+    """
+    r_path = outprefix + ".susie.R"
+    code = f"""\
+args <- commandArgs(trailingOnly = TRUE)
+z_file    <- args[1]
+ld_file   <- args[2]
+out_prefix <- args[3]
+L         <- as.integer(args[4])
+coverage  <- as.numeric(args[5])
+
+suppressPackageStartupMessages({{
+  library(data.table)
+  library(Matrix)
+  library(susieR)
+}})
+
+z  <- fread(z_file, header = TRUE)
+LD <- as.matrix(fread(ld_file, header = FALSE))
+
+# Convert beta/se to z-scores
+zscore <- z$beta / z$se
+
+# Run SuSiE with summary statistics and LD matrix
+fit <- susie_rss(zscore, R = LD, L = L, coverage = coverage, refine = TRUE)
+cs  <- susie_get_cs(fit, Xcorr = LD)
+
+saveRDS(fit, file = paste0(out_prefix, ".susie.fit.rds"))
+saveRDS(cs,  file = paste0(out_prefix, ".susie.cs.rds"))
+
+# Write variant-level PIP table
+pip <- data.frame(rsid = z$rsid, pip = fit$pip)
+data.table::fwrite(pip, file = paste0(out_prefix, ".susie.pip.tsv"), sep = "\\t")
+
+cat("[susie] Done.", nrow(pip), "variants.\\n")
+"""
+    with open(r_path, "w") as fh:
+        fh.write(code)
+    return r_path
+
+
+# ==================== MAIN ====================
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=(
+            "Fine-map ExWAS loci using WES LD. "
+            "Expects REGENIE step 2 summary statistics as input."
+        )
+    )
+
+    # Required inputs
+    ap.add_argument(
+        "--sumstats", required=True,
+        help=(
+            "Combined REGENIE step 2 association table "
+            "(all chromosomes merged into one file)"
+        ),
+    )
+    ap.add_argument(
+        "--wes-prefix", required=True,
+        help="WES PLINK prefix with {CHR} placeholder",
+    )
+    ap.add_argument(
+        "--keep", required=True,
+        help="FID IID keep file (same participants used in ExWAS)",
+    )
+    ap.add_argument(
+        "--outdir", required=True,
+        help="Output directory for fine-mapping results",
+    )
+    ap.add_argument(
+        "--n", type=int, required=True,
+        help=(
+            "Effective sample size for this analysis "
+            "(read from REGENIE step 2 log; for this study n=91184)"
+        ),
+    )
+
+    # Locus definition
+    ap.add_argument(
+        "--p-thresh", type=float, default=5e-8,
+        help="Genome-wide significance threshold for lead variant selection (default: 5e-8)",
+    )
+    ap.add_argument(
+        "--window-kb", type=int, default=500,
+        help="+/- window around each lead variant in kilobases (default: 500)",
+    )
+    ap.add_argument("--clump-r2",  type=float, default=0.1)
+    ap.add_argument("--clump-kb",  type=int,   default=500)
+    ap.add_argument("--clump-p2",  type=float, default=1e-6)
+
+    # REGENIE column names (defaults match standard REGENIE step 2 output)
+    ap.add_argument("--id-col",   default="ID",     help="Variant ID column")
+    ap.add_argument("--chr-col",  default="CHROM",  help="Chromosome column")
+    ap.add_argument("--pos-col",  default="GENPOS", help="Position column")
+    ap.add_argument("--a1-col",   default="ALLELE1",help="Effect allele column")
+    ap.add_argument("--a2-col",   default="ALLELE0",help="Other allele column")
+    ap.add_argument("--beta-col", default="BETA",   help="Effect size column")
+    ap.add_argument("--se-col",   default="SE",     help="Standard error column")
+    ap.add_argument(
+        "--p-col", default="LOG10P",
+        help="P-value column (REGENIE outputs -log10(p) as LOG10P; converted automatically)",
+    )
+    ap.add_argument("--n-col", default=None, help="Per-variant sample size column (optional)")
+
+    # Fine-mapping tools
+    ap.add_argument(
+        "--finemap-exe", default=None,
+        help="Path to FINEMAP executable. If provided, FINEMAP is run automatically.",
+    )
+    ap.add_argument(
+        "--run-susie", action="store_true",
+        help="Run SuSiE via Rscript (requires susieR installed in R environment)",
+    )
+    ap.add_argument("--phenotype", default=None,
+                    help="Phenotype name to filter on if the sumstats file contains multiple traits")
+
+    args = ap.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # ---- Load and standardise summary statistics ----
+    cols = {
+        "id":   args.id_col,
+        "chr":  args.chr_col,
+        "pos":  args.pos_col,
+        "a1":   args.a1_col,
+        "a2":   args.a2_col,
+        "beta": args.beta_col,
+        "se":   args.se_col,
+        "p":    args.p_col,
+    }
+    if args.n_col:
+        cols["n"] = args.n_col
+
+    df = read_sumstats(args.sumstats, cols)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["BETA", "SE", "P"])
+
+    # Standardise chromosome column
+    df["CHR"] = (
+        df["CHR"].astype(str)
+        .str.replace("chr", "", regex=False)
+        .replace({"X": "23", "Y": "24"})
+    )
+    df["CHR"] = pd.to_numeric(df["CHR"], errors="coerce")
+    df = df.dropna(subset=["CHR", "BP"]).astype({"CHR": int, "BP": int})
+
+    if args.phenotype and "PHENO" in df.columns:
+        df = df[df["PHENO"] == args.phenotype].copy()
+
+    print(f"[ok] Loaded {len(df):,} variants from summary statistics")
+
+    # ---- Clump to identify independent lead variants ----
+    clump_prefix = os.path.join(args.outdir, "clump")
+    clump_in = os.path.join(args.outdir, "clump_input.tsv")
+    df[["CHR", "BP", "SNP", "P"]].to_csv(clump_in, sep="\t", index=False)
+
+    lead_path, leads = plink2_clump(
+        clump_in, args.wes_prefix, args.keep, clump_prefix,
+        p1=args.p_thresh, p2=args.clump_p2,
+        r2=args.clump_r2, kb=args.clump_kb,
+    )
+
+    # ---- Fine-map each locus ----
+    results = []
+    for _, row in leads.iterrows():
+        chrn  = int(row["CHR"])
+        bp    = int(row["BP"])
+        start = max(1, bp - args.window_kb * 1000)
+        end   = bp + args.window_kb * 1000
+
+        locus_tag = f"chr{chrn}_{bp}_{args.window_kb}kb"
+        locus_dir = os.path.join(args.outdir, locus_tag)
+        os.makedirs(locus_dir, exist_ok=True)
+
+        print(f"\n[locus] {locus_tag}")
+
+        # Extract region genotypes and compute WES LD matrix
+        bed, bim, fam, ld_gz = extract_region_and_ld(
+            chrn, start, end,
+            args.wes_prefix, args.keep,
+            os.path.join(locus_dir, "locus"),
+        )
+
+        # Subset summary statistics to this locus
+        bim_df   = pd.read_csv(bim, sep="\t", header=None,
+                               names=["CHR", "SNP", "CM", "BP", "A1b", "A2b"])
+        set_snps = set(bim_df["SNP"])
+        sub = df[
+            (df["CHR"] == chrn) &
+            (df["BP"] >= start) &
+            (df["BP"] <= end) &
+            (df["SNP"].isin(set_snps))
+        ].copy()
+
+        if sub.empty:
+            print(f"  [warn] No overlapping variants between sumstats and LD matrix; skipping.")
+            continue
+
+        # Prepare FINEMAP / SuSiE input files
+        fin = make_finemap_inputs(
+            sub, ld_gz, bim,
+            args.n,
+            os.path.join(locus_dir, "finemap"),
+        )
+
+        # Optionally run FINEMAP
+        if args.finemap_exe:
+            run(
+                [args.finemap_exe, "--sss", "--in-files",
+                 os.path.basename(fin["master"])],
+                cwd=locus_dir,
+            )
+
+        # Optionally run SuSiE
+        if args.run_susie:
+            rfile = write_susie_runner(os.path.join(locus_dir, "finemap"))
+            run(
+                ["Rscript", os.path.basename(rfile),
+                 os.path.basename(fin["z"]),
+                 os.path.basename(fin["ld"]),
+                 "finemap", "10", "0.95"],
+                cwd=locus_dir,
+            )
+
+        results.append({
+            "locus":  locus_tag,
+            "chr":    chrn,
+            "lead_bp": bp,
+            "start":  start,
+            "end":    end,
+            "n_snps": len(sub),
+        })
+
+    # ---- Write loci manifest ----
+    manifest = pd.DataFrame(results)
+    manifest_path = os.path.join(args.outdir, "loci_manifest.tsv")
+    manifest.to_csv(manifest_path, sep="\t", index=False)
+
+    print(f"\n[done] Fine-mapping complete.")
+    print(f"       Loci processed : {len(results)}")
+    print(f"       Manifest       : {manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
